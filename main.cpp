@@ -1,6 +1,5 @@
 #include <arpa/inet.h>
 #include <array>
-#include <unordered_map>
 #include <cassert>
 #include <cerrno>
 #include <concepts>
@@ -17,6 +16,7 @@
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <variant>
 void assert_error(bool condition,
                   std::source_location const location = std::source_location::current());
@@ -193,7 +193,6 @@ struct WriteData {
 
 using ResumeVariant = std::variant<AcceptData, ReadData, WriteData>;
 
-
 struct EpollRuntime {
 private:
     int epoll_fd = -1;
@@ -220,6 +219,22 @@ public:
     };
 
     std::unordered_map<int, FdData> fd_map;
+
+    void remove_watch(int fd) {
+        auto it = fd_map.find(fd);
+        if (it != fd_map.end()) {
+            // 从 epoll 中删除
+            if (::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) == -1) {
+                perror("epoll_ctl DEL failed");
+            }
+
+            // 释放挂起的 resume_data
+            // delete it->second.data;
+
+            // 从管理结构中移除
+            fd_map.erase(it);
+        }
+    }
 
     void add_watch(ResumeVariant var, std::coroutine_handle<> handle) {
         int fd = std::visit([](auto &v) { return v.fd; }, var);
@@ -372,6 +387,7 @@ struct accept_awaiter {
     }
 
     std::expected<int, std::error_code> await_resume() noexcept {
+        // EpollRuntime::ins().remove_watch(listen_fd_);
         return std::move(ret_);
     }
 };
@@ -392,6 +408,7 @@ struct read_awaiter {
     }
 
     std::expected<size_t, std::error_code> await_resume() noexcept {
+        // EpollRuntime::ins().remove_watch(fd_);
         return std::move(ret_);
     }
 };
@@ -412,6 +429,7 @@ struct write_awaiter {
     }
 
     std::expected<size_t, std::error_code> await_resume() noexcept {
+        // EpollRuntime::ins().remove_watch(fd_);
         return std::move(ret_);
     }
 };
@@ -455,13 +473,84 @@ task_coro<int> async_echo_client(int client_fd) {
     } catch (...) {
         std::cerr << "client fd=" << client_fd << " disconnected with exception\n";
     }
-
+    EpollRuntime::ins().remove_watch(client_fd);
     close(client_fd);
+    co_return 0;
+}
+
+task_coro<int> async_http_client(int client_fd) {
+    try {
+        std::string request_buffer; // 累积请求数据
+        std::array<char, 1024> buf{};
+
+        // 读取 HTTP 请求直到 \r\n\r\n
+        while (true) {
+            auto r = co_await read_awaiter(client_fd, buf);
+            if (!r) {
+                // 读出错或连接关闭
+                std::cerr << "read failed on fd=" << client_fd << ": " << r.error().message()
+                          << std::endl;
+                co_return -1;
+            }
+
+            if (*r == 0) {
+                // 客户端关闭发送
+                break;
+            }
+
+            request_buffer.append(buf.data(), *r);
+
+            // 检查是否完整 HTTP 请求结束
+            if (request_buffer.find("\r\n\r\n") != std::string::npos) {
+                break;
+            }
+        }
+
+        // 这里可以选择打印请求头（可选）
+        std::cout << "Received request:\n" << request_buffer << std::endl;
+
+        // 固定 HTTP 响应
+        char const resp[] = "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "Content-Length: 13\r\n"
+                            "\r\n"
+                            "Hello, world!";
+
+        size_t total = 0;
+        while (total < sizeof(resp) - 1) {
+            std::span<char const> buf(resp + total, sizeof(resp) - 1 - total);
+            auto w = co_await write_awaiter(client_fd, buf);
+            if (!w) {
+                std::cerr << "write failed on fd=" << client_fd << ": " << w.error().message()
+                          << std::endl;
+                break;
+            }
+            total += *w;
+        }
+
+    } catch (...) {
+        std::cerr << "client fd=" << client_fd << " disconnected with error\n";
+    }
+    EpollRuntime::ins().remove_watch(client_fd);
+
+    // close(client_fd);
+    std ::cout << "Closed connection on fd=" << client_fd << std::endl;
     co_return 0;
 }
 
 task_coro<int> async_accept_loop(int listen_fd) {
     while (!g_stop) {
+        struct _guard {
+            int fd;
+
+            ~_guard() {
+                if (fd != -1) {
+                    EpollRuntime::ins().remove_watch(fd);
+                }
+            }
+        };
+
+        _guard guard{listen_fd};
         auto r = co_await accept_awaiter(listen_fd);
         if (!r) {
             std::cerr << "accept failed: " << r.error().message() << std::endl;
@@ -469,7 +558,7 @@ task_coro<int> async_accept_loop(int listen_fd) {
         }
         int client_fd = *r;
         std::cout << "accept fd: " << client_fd << std::endl;
-        co_await async_echo_client(client_fd);
+        co_await async_http_client(client_fd);
     }
     co_return 0;
 }
