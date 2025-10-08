@@ -1,6 +1,6 @@
 #include <arpa/inet.h>
 #include <array>
-#include <bitset>
+#include <unordered_map>
 #include <cassert>
 #include <cerrno>
 #include <concepts>
@@ -193,6 +193,7 @@ struct WriteData {
 
 using ResumeVariant = std::variant<AcceptData, ReadData, WriteData>;
 
+
 struct EpollRuntime {
 private:
     int epoll_fd = -1;
@@ -213,46 +214,42 @@ public:
         std::coroutine_handle<> handle;
     };
 
-    static constexpr int MAX_FDS = 65536; // 假设 fd 不超过这个数
-    std::bitset<MAX_FDS> fd_registered;
-    std::array<uint32_t, MAX_FDS> fd_events{0};
+    struct FdData {
+        resume_data *data;
+        uint32_t events = 0;
+    };
+
+    std::unordered_map<int, FdData> fd_map;
 
     void add_watch(ResumeVariant var, std::coroutine_handle<> handle) {
         int fd = std::visit([](auto &v) { return v.fd; }, var);
-        auto *p = new resume_data{std::move(var), handle};
 
-        epoll_event ev{};
-        ev.data.ptr = p;
-
-        uint32_t new_events = 0;
-        std::visit(
-            [&](auto &v) {
+        // 计算新事件
+        uint32_t new_events = std::visit(
+            [](auto &v) -> uint32_t {
                 using T = std::decay_t<decltype(v)>;
                 if constexpr (std::is_same_v<T, AcceptData> || std::is_same_v<T, ReadData>) {
-                    new_events = EPOLLIN | EPOLLRDHUP;
-                } else if constexpr (std::is_same_v<T, WriteData>) {
-                    new_events = EPOLLOUT | EPOLLRDHUP;
+                    return EPOLLIN | EPOLLRDHUP;
+                } else {
+                    return EPOLLOUT | EPOLLRDHUP;
                 }
             },
-            p->var);
+            var);
 
-        if (fd_registered.test(fd)) {
-            // 已注册，MOD 时保留之前的事件
-            ev.events = fd_events[fd] | new_events;
-            if (::epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) == -1) {
-                perror("epoll_ctl MOD failed");
-            } else {
-                fd_events[fd] = ev.events;
-            }
-        } else {
-            ev.events = new_events;
-            if (::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) {
-                perror("epoll_ctl ADD failed");
-            } else {
-                fd_registered.set(fd);
-                fd_events[fd] = ev.events;
-            }
+        FdData &fddata = fd_map[fd]; // 自动创建
+        fddata.data = (new resume_data{std::move(var), handle});
+
+        uint32_t combined_events = fddata.events | new_events;
+        epoll_event ev{};
+        ev.events = combined_events;
+        ev.data.ptr = fddata.data;
+
+        int op = fddata.events ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+        if (::epoll_ctl(epoll_fd, op, fd, &ev) == -1) {
+            throw std::system_error(errno, std::generic_category(), "epoll_ctl failed");
         }
+
+        fddata.events = combined_events;
     }
 
     static int const MAX_EVENTS = 10;
