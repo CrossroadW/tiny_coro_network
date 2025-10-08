@@ -228,10 +228,6 @@ public:
                 perror("epoll_ctl DEL failed");
             }
 
-            // 释放挂起的 resume_data
-            // delete it->second.data;
-
-            // 从管理结构中移除
             fd_map.erase(it);
         }
     }
@@ -365,6 +361,7 @@ public:
 
             // 仅在真正准备好或者发生错误时 resume 并删除
             if (ready_to_resume) {
+                remove_watch(std::visit([](auto &v) { return v.fd; }, p->var));
                 p->handle.resume();
                 delete p;
             }
@@ -387,7 +384,6 @@ struct accept_awaiter {
     }
 
     std::expected<int, std::error_code> await_resume() noexcept {
-        // EpollRuntime::ins().remove_watch(listen_fd_);
         return std::move(ret_);
     }
 };
@@ -408,7 +404,6 @@ struct read_awaiter {
     }
 
     std::expected<size_t, std::error_code> await_resume() noexcept {
-        // EpollRuntime::ins().remove_watch(fd_);
         return std::move(ret_);
     }
 };
@@ -429,7 +424,6 @@ struct write_awaiter {
     }
 
     std::expected<size_t, std::error_code> await_resume() noexcept {
-        // EpollRuntime::ins().remove_watch(fd_);
         return std::move(ret_);
     }
 };
@@ -531,26 +525,15 @@ task_coro<int> async_http_client(int client_fd) {
     } catch (...) {
         std::cerr << "client fd=" << client_fd << " disconnected with error\n";
     }
-    EpollRuntime::ins().remove_watch(client_fd);
 
-    // close(client_fd);
+    close(client_fd);
     std ::cout << "Closed connection on fd=" << client_fd << std::endl;
     co_return 0;
 }
 
 task_coro<int> async_accept_loop(int listen_fd) {
     while (!g_stop) {
-        struct _guard {
-            int fd;
-
-            ~_guard() {
-                if (fd != -1) {
-                    EpollRuntime::ins().remove_watch(fd);
-                }
-            }
-        };
-
-        _guard guard{listen_fd};
+      
         auto r = co_await accept_awaiter(listen_fd);
         if (!r) {
             std::cerr << "accept failed: " << r.error().message() << std::endl;
